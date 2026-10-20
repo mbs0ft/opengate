@@ -24,7 +24,8 @@ this is a very early build of the tweak. **tested on VK 2.15.3.** other versions
 - global feed
 - fetching dialogues
 - videos tab
-- uploading photos in new posts
+- uploading media from device in new posts
+- audio status
 
 ## installation
 1. download the latest release from the releases section
