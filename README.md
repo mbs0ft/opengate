@@ -1,4 +1,6 @@
 # opengate
+[English] | [Русский](README.ru.md)
+
 **wip – testing needed!**  
 
 a tweak for the legacy VK iOS app that redirects VK API requests to OpenVK instances
