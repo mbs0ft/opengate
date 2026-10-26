@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>items</key>
+    <array>
+        <dict>
+            <key>cell</key>
+            <string>PSGroupCell</string>
+            <key>label</key>
+            <string>Основные настройки OpenGate</string>
+            <key>footerText</key>
+            <string>Версия: 0.1 alpha</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSLinkCell</string>
+            <key>detail</key>
+            <string>InstanceSelectionViewController</string>
+            <key>label</key>
+            <string>Выбор инстанса OpenVK</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSSwitchCell</string>
+            <key>default</key>
+            <true/>
+            <key>defaults</key>
+            <string>mbsoft.opengate</string>
+            <key>key</key>
+            <string>mbsoft.opengate.enabled</string>
+            <key>label</key>
+            <string>Включить OpenGate</string>
+        </dict>
+    </array>
+    <key>title</key>
+    <string>OpenGate</string>
+</dict>
+</plist>
