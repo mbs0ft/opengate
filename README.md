@@ -6,7 +6,7 @@
 a tweak for the legacy VK iOS app that redirects VK API requests to OpenVK instances
 
 ## testing
-this is a very early build of the tweak. **tested on VK 2.15.3.** other versions have not been tested yet. please open an issue to report which versions are working
+this is a very early build of the tweak. **tested on VK 2.15.3 and 3.3.2.** other versions have not been tested yet. please open an issue to report which versions are working
 
 ## feature status
 
