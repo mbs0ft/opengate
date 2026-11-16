@@ -12,6 +12,7 @@ static NSString *g_lastPhotoId = nil;
 static NSString *g_lastPhotoOwnerId = nil;
 static NSDictionary *g_savedWallPhotoDict = nil;
 static NSMutableDictionary *g_audioCache = nil;
+static NSString *g_audioUserId = nil;
 static BOOL g_expectSaveWallPhoto = NO;
 static BOOL g_expectDialogs = NO;
 static BOOL g_isVK3 = NO;
@@ -471,69 +472,98 @@ NSString *rewriteURL(NSString *urlStr) {
         g_expectDialogs = YES;
     }
 
-    if ([newUrl containsString:@"method/execute"]) {
+        if ([newUrl containsString:@"method/execute"]) {
         NSRange qRange = [newUrl rangeOfString:@"?"];
         if (qRange.location != NSNotFound) {
             NSString *base = [newUrl substringToIndex:qRange.location + 1];
             NSString *query = [newUrl substringFromIndex:qRange.location + 1];
-            NSString *decoded = [query stringByRemovingPercentEncoding];
-            if (!decoded) decoded = query;
-            NSString *original = decoded;
+            
+            // Находим code= в query
+            NSRange codeStart = [query rangeOfString:@"code="];
+            if (codeStart.location != NSNotFound) {
+                NSUInteger codeValueStart = codeStart.location + codeStart.length;
+                NSRange ampRange = [query rangeOfString:@"&" options:0 range:NSMakeRange(codeValueStart, query.length - codeValueStart)];
+                
+                NSString *beforeCode = [query substringToIndex:codeValueStart];
+                NSString *afterCode = @"";
+                NSString *encodedCodeValue;
+                
+                if (ampRange.location == NSNotFound) {
+                    encodedCodeValue = [query substringFromIndex:codeValueStart];
+                } else {
+                    encodedCodeValue = [query substringWithRange:NSMakeRange(codeValueStart, ampRange.location - codeValueStart)];
+                    afterCode = [query substringFromIndex:ampRange.location];
+                }
+                
+                // Декодируем ТОЛЬКО значение code
+                NSString *decoded = [encodedCodeValue stringByRemovingPercentEncoding];
+                if (!decoded) decoded = encodedCodeValue;
+                NSString *original = decoded;
 
-            decoded = regexReplace(decoded, @"API\\.execute\\.newsfeed\\s*\\([^)]*\\)", @"API.newsfeed.get({count:20, filters:\"post,photo\", extended:1})");
-            decoded = regexReplace(decoded, @"API\\.execute\\.newsfeedUpdateTimeout\\s*\\([^)]*\\)", @"0");
-            decoded = regexReplace(decoded, @"API\\.internal\\.getSituationalSuggest\\s*\\([^)]*\\)", @"{items:[]}");
-            decoded = regexReplace(decoded, @"API\\.account\\.getMenu\\s*\\([^)]*\\)", @"{items:[]}");
-            decoded = regexReplace(decoded, @"API\\.apps\\.getFromMenu\\s*\\([^)]*\\)", @"{items:[]}");
-            decoded = regexReplace(decoded, @"API\\.store\\.hasNewItems\\s*\\([^)]*\\)", @"{stickers_version_hash:\"\"}");
-            decoded = regexReplace(decoded, @"API\\.store\\.markAsViewed\\s*\\([^)]*\\)", @"false");
-            decoded = regexReplace(decoded, @"API\\.store\\.getProducts\\s*\\([^)]*\\)", @"{items:[]}");
-            decoded = regexReplace(decoded, @"API\\.masks\\.getModel\\s*\\([^)]*\\)", @"{engines:[]}");
-            decoded = regexReplace(decoded, @"API\\.masks\\.getCatalog\\s*\\([^)]*\\)", @"{items:[]}");
-            decoded = regexReplace(decoded, @"API\\.fave\\.getPhotos\\s*\\([^)]*\\)", @"{count:0, items:[]}");
-            decoded = regexReplace(decoded, @"API\\.stories\\.get\\s*\\([^)]*\\)", @"{count:0, items:[]}");
-            decoded = regexReplace(decoded, @"API\\.stats\\.trackEvents\\s*\\([^)]*\\)", @"1");
-            decoded = regexReplace(decoded, @"API\\.stats\\.benchmark\\s*\\([^)]*\\)", @"{}");
+                decoded = regexReplace(decoded, @"API\\.execute\\.newsfeed\\s*\\([^)]*\\)", @"API.newsfeed.get({count:20, filters:\"post,photo\", extended:1})");
+                decoded = regexReplace(decoded, @"API\\.execute\\.newsfeedUpdateTimeout\\s*\\([^)]*\\)", @"0");
+                decoded = regexReplace(decoded, @"API\\.internal\\.getSituationalSuggest\\s*\\([^)]*\\)", @"{items:[]}");
+                decoded = regexReplace(decoded, @"API\\.account\\.getMenu\\s*\\([^)]*\\)", @"{items:[]}");
+                decoded = regexReplace(decoded, @"API\\.apps\\.getFromMenu\\s*\\([^)]*\\)", @"{items:[]}");
+                decoded = regexReplace(decoded, @"API\\.store\\.hasNewItems\\s*\\([^)]*\\)", @"{stickers_version_hash:\"\"}");
+                decoded = regexReplace(decoded, @"API\\.store\\.markAsViewed\\s*\\([^)]*\\)", @"false");
+                decoded = regexReplace(decoded, @"API\\.store\\.getProducts\\s*\\([^)]*\\)", @"{items:[]}");
+                decoded = regexReplace(decoded, @"API\\.masks\\.getModel\\s*\\([^)]*\\)", @"{engines:[]}");
+                decoded = regexReplace(decoded, @"API\\.masks\\.getCatalog\\s*\\([^)]*\\)", @"{items:[]}");
+                decoded = regexReplace(decoded, @"API\\.fave\\.getPhotos\\s*\\([^)]*\\)", @"{count:0, items:[]}");
+                decoded = regexReplace(decoded, @"API\\.stories\\.get\\s*\\([^)]*\\)", @"{count:0, items:[]}");
+                decoded = regexReplace(decoded, @"API\\.stats\\.trackEvents\\s*\\([^)]*\\)", @"1");
+                decoded = regexReplace(decoded, @"API\\.stats\\.benchmark\\s*\\([^)]*\\)", @"{}");
 
-            decoded = regexReplace(decoded, @"audio:API\\.audio\\.getById\\(\\{audios:\"\\d+\" \\+ audio_id\\}\\)\\[0\\],", @"audio:null,");
+                decoded = regexReplace(decoded, @"audio:API\\.audio\\.getById\\(\\{audios:\"\\d+\" \\+ audio_id\\}\\)\\[0\\],", @"audio:null,");
+                decoded = regexReplace(decoded, @",filters:\"[^\"]*\"", @"");
+                decoded = regexReplace(decoded, @",filter:\"\"", @"");
+                decoded = regexReplace(decoded, @",filter:filter", @"");
 
-            NSError *uidErr = nil;
-            NSRegularExpression *uidRe = [NSRegularExpression regularExpressionWithPattern:@"user_id\"?\\s*:\\s*(\\d+)" options:0 error:&uidErr];
-            NSTextCheckingResult *uidMatch = uidRe ? [uidRe firstMatchInString:decoded options:0 range:NSMakeRange(0, decoded.length)] : nil;
-            if (uidMatch && [uidMatch numberOfRanges] > 1) {
-                NSString *uid = [decoded substringWithRange:[uidMatch rangeAtIndex:1]];
-                NSString *vidStub = [NSString stringWithFormat:@"API.video.get({owner_id:%@,count:1,offset:0})", uid];
-                decoded = regexReplace(decoded, @"API\\.video\\.getAlbums\\s*\\([^)]*\\)", vidStub);
-                decoded = regexReplace(decoded, @"API\\.video\\.getAlbumById\\s*\\([^)]*\\)", vidStub);
-            }
+                NSError *uidErr = nil;
+                NSRegularExpression *uidRe = [NSRegularExpression regularExpressionWithPattern:@"user_id\"?\\s*:\\s*(\\d+)" options:0 error:&uidErr];
+                NSTextCheckingResult *uidMatch = uidRe ? [uidRe firstMatchInString:decoded options:0 range:NSMakeRange(0, decoded.length)] : nil;
+                if (uidMatch && [uidMatch numberOfRanges] > 1) {
+                    NSString *uid = [decoded substringWithRange:[uidMatch rangeAtIndex:1]];
+                    NSString *vidStub = [NSString stringWithFormat:@"API.video.get({owner_id:%@,count:1,offset:0})", uid];
+                    decoded = regexReplace(decoded, @"API\\.video\\.getAlbums\\s*\\([^)]*\\)", vidStub);
+                    decoded = regexReplace(decoded, @"API\\.video\\.getAlbumById\\s*\\([^)]*\\)", vidStub);
+                }
 
-            if (isVK3()) {
-                decoded = regexReplace(decoded, @"API\\.internal\\.getUserNotifications\\s*\\([^)]*\\)", @"API.notifications.get({count:50, extended:1})");
-            } else {
-                decoded = regexReplace(decoded, @"API\\.internal\\.getUserNotifications\\s*\\([^)]*\\)", @"{count:0, items:[]}");
-            }
+                if (isVK3()) {
+                    decoded = regexReplace(decoded, @"API\\.internal\\.getUserNotifications\\s*\\([^)]*\\)", @"API.notifications.get({count:50, extended:1})");
+                } else {
+                    decoded = regexReplace(decoded, @"API\\.internal\\.getUserNotifications\\s*\\([^)]*\\)", @"{count:0, items:[]}");
+                }
 
-            if (g_lastPhotoId && g_lastPhotoOwnerId) {
-                NSRegularExpression *wallRe = [NSRegularExpression regularExpressionWithPattern:@"API\\.wall\\.post\\((\\{[^}]*\\})\\)" options:0 error:nil];
-                NSTextCheckingResult *wallMatch = [wallRe firstMatchInString:decoded options:0 range:NSMakeRange(0, decoded.length)];
-                if (wallMatch && [wallMatch numberOfRanges] > 1) {
-                    NSRange jsonRange = [wallMatch rangeAtIndex:1];
-                    NSString *wallJson = [decoded substringWithRange:jsonRange];
-                    if (![wallJson containsString:@"attachments"]) {
-                        NSString *tail = [NSString stringWithFormat:@",\"attachments\":\"photo%@_%@\"}", g_lastPhotoOwnerId, g_lastPhotoId];
-                        NSString *newJson = [wallJson stringByReplacingCharactersInRange:NSMakeRange(wallJson.length - 1, 1) withString:tail];
-                        decoded = [decoded stringByReplacingCharactersInRange:jsonRange withString:newJson];
-                        NSLog(@"[OpenGate] Injected attachments into wall.post: photo%@_%@", g_lastPhotoOwnerId, g_lastPhotoId);
-                        g_lastPhotoId = nil;
-                        g_lastPhotoOwnerId = nil;
+                if (g_lastPhotoId && g_lastPhotoOwnerId) {
+                    NSRegularExpression *wallRe = [NSRegularExpression regularExpressionWithPattern:@"API\\.wall\\.post\\((\\{[^}]*\\})\\)" options:0 error:nil];
+                    NSTextCheckingResult *wallMatch = [wallRe firstMatchInString:decoded options:0 range:NSMakeRange(0, decoded.length)];
+                    if (wallMatch && [wallMatch numberOfRanges] > 1) {
+                        NSRange jsonRange = [wallMatch rangeAtIndex:1];
+                        NSString *wallJson = [decoded substringWithRange:jsonRange];
+                        if (![wallJson containsString:@"attachments"]) {
+                            NSString *tail = [NSString stringWithFormat:@",\"attachments\":\"photo%@_%@\"}", g_lastPhotoOwnerId, g_lastPhotoId];
+                            NSString *newJson = [wallJson stringByReplacingCharactersInRange:NSMakeRange(wallJson.length - 1, 1) withString:tail];
+                            decoded = [decoded stringByReplacingCharactersInRange:jsonRange withString:newJson];
+                            NSLog(@"[OpenGate] Injected attachments into wall.post: photo%@_%@", g_lastPhotoOwnerId, g_lastPhotoId);
+                            g_lastPhotoId = nil;
+                            g_lastPhotoOwnerId = nil;
+                        }
                     }
                 }
-            }
 
-            if (![decoded isEqualToString:original]) {
-                NSString *encoded = [decoded stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
-                encoded = [encoded stringByReplacingOccurrencesOfString:@"+" withString:@"%2B"];
-                newUrl = [[base stringByAppendingString:encoded] mutableCopy];
+                if (![decoded isEqualToString:original]) {
+                    // Кодируем обратно, ИСКЛЮЧАЯ & и = из allowed set
+                    NSMutableCharacterSet *cs = [[NSCharacterSet URLQueryAllowedCharacterSet] mutableCopy];
+                    [cs removeCharactersInString:@"&="];
+                    NSString *encoded = [decoded stringByAddingPercentEncodingWithAllowedCharacters:cs];
+                    encoded = [encoded stringByReplacingOccurrencesOfString:@"+" withString:@"%2B"];
+                    encoded = [encoded stringByReplacingOccurrencesOfString:@"&&" withString:@"%26%26"];
+                    newUrl = [[base stringByAppendingString:beforeCode] mutableCopy];
+                    [newUrl appendString:encoded];
+                    [newUrl appendString:afterCode];
+                }
             }
         }
     }
@@ -617,6 +647,22 @@ NSString *rewriteURL(NSString *urlStr) {
         NSString *bodyStr = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
         if (bodyStr) {
             cacheTokenFromURL(bodyStr);
+            
+            NSRange ownerRange = [bodyStr rangeOfString:@"owner_id="];
+            if (ownerRange.location != NSNotFound) {
+                NSUInteger start = ownerRange.location + 9;
+                NSRange ampRange = [bodyStr rangeOfString:@"&" options:0 range:NSMakeRange(start, bodyStr.length - start)];
+                NSString *ownerId;
+                if (ampRange.location == NSNotFound) {
+                    ownerId = [bodyStr substringFromIndex:start];
+                } else {
+                    ownerId = [bodyStr substringWithRange:NSMakeRange(start, ampRange.location - start)];
+                }
+                ownerId = [ownerId stringByRemovingPercentEncoding];
+                if (ownerId && ownerId.length > 0) {
+                    g_audioUserId = ownerId;
+                }
+            }
         }
     }
 
@@ -738,12 +784,26 @@ NSString *rewriteURL(NSString *urlStr) {
             collectAudio(mrd ?: rd, 8);
 
             NSDictionary *cur = mrd ?: rd;
-            if (cur[@"audio_id"] && !cur[@"audio"]) {
-                id cached = g_audioCache[[cur[@"audio_id"] description]];
-                if (cached) {
-                    if (!mrd) mrd = [rd mutableCopy];
-                    mrd[@"audio"] = cached;
-                    mrd[@"audio_id"] = cached[@"id"];
+            if (cur[@"audio_id"] && (cur[@"audio"] == nil || cur[@"audio"] == [NSNull null])) {
+                NSString *audioIdStr = [cur[@"audio_id"] description];
+                NSArray *parts = [audioIdStr componentsSeparatedByString:@"_"];
+                
+                if (parts.count == 2) {
+                    NSString *ownerId = parts[0];
+                    NSString *trackId = parts[1];
+                    NSString *cacheKey = [NSString stringWithFormat:@"%@_%@", ownerId, trackId];
+                    
+                    id cached = g_audioCache[cacheKey];
+                    if (cached) {
+                        if (!mrd) mrd = [rd mutableCopy];
+                        NSMutableDictionary *cachedCopy = [cached mutableCopy];
+                        if (g_audioUserId) {
+                            cachedCopy[@"owner_id"] = g_audioUserId;
+                        }
+                        mrd[@"audio"] = cachedCopy;
+                        mrd[@"audio_id"] = @([trackId longLongValue]);
+                        NSLog(@"[OpenGate] Injected cached audio %@, owner=%@, audio_id=%@", trackId, cachedCopy[@"owner_id"], mrd[@"audio_id"]);
+                    }
                 }
             }
 
@@ -779,6 +839,29 @@ NSString *rewriteURL(NSString *urlStr) {
         }
     }
     return result;
+}
+
+%end
+
+@interface VKPhoto : NSObject
+- (void)process:(id)dict context:(id)context;
+@end
+
+%hook VKPhoto
+
+- (void)process:(id)dict context:(id)context {
+    if ([dict isKindOfClass:[NSDictionary class]]) {
+        NSNumber *al = dict[@"album_id"];
+        NSNumber *aid = dict[@"aid"];
+        if ((al && [al integerValue] == 0) || (aid && [aid integerValue] == 0)) {
+            NSMutableDictionary *m = [dict mutableCopy];
+            m[@"album_id"] = @(-7);
+            m[@"aid"] = @(-7);
+            dict = m;
+            NSLog(@"[OpenGate] VKPhoto album -> -7");
+        }
+    }
+    %orig(dict, context);
 }
 
 %end
