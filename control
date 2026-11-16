@@ -1,8 +1,8 @@
 Package: mbsoft.opengate
 Name: OpenGate
-Version: 0.3-alpha
+Version: 0.3.1-alpha
 Architecture: iphoneos-arm
-Description: Redirects VK requests to OpenVK instances
+Description: Tweak that redirects VK requests to OpenVK instances
 Maintainer: mbsoft
 Author: mbsoft
 Depends: mobilesubstrate (>= 0.9.7000)

@@ -11,6 +11,7 @@ static NSString *cachedInstance = nil;
 static NSString *g_lastPhotoId = nil;
 static NSString *g_lastPhotoOwnerId = nil;
 static NSDictionary *g_savedWallPhotoDict = nil;
+static NSMutableDictionary *g_audioCache = nil;
 static BOOL g_expectSaveWallPhoto = NO;
 static BOOL g_expectDialogs = NO;
 static BOOL g_isVK3 = NO;
@@ -78,6 +79,70 @@ static void cacheTokenFromURL(NSString *urlStr) {
     }
 }
 
+static BOOL looksLikePhotoDict(NSDictionary *d) {
+    if (!(d[@"pid"] || d[@"id"])) return NO;
+    if (!d[@"owner_id"]) return NO;
+    return (d[@"sizes"] || d[@"photo_604"] || d[@"album_id"]);
+}
+
+static void collectAudio(id node, NSInteger depth) {
+    if (depth <= 0 || !node) return;
+    if ([node isKindOfClass:[NSArray class]]) {
+        for (id v in (NSArray *)node) collectAudio(v, depth - 1);
+        return;
+    }
+    if (![node isKindOfClass:[NSDictionary class]]) return;
+    NSDictionary *d = node;
+    if (d[@"artist"] && d[@"title"] && d[@"owner_id"] && d[@"id"]) {
+        if (!g_audioCache) g_audioCache = [NSMutableDictionary dictionary];
+        NSString *key = [NSString stringWithFormat:@"%@_%@", d[@"owner_id"], d[@"id"]];
+        g_audioCache[key] = d;
+    }
+    for (NSString *k in d) {
+        id v = d[k];
+        if ([v isKindOfClass:[NSDictionary class]] || [v isKindOfClass:[NSArray class]]) collectAudio(v, depth - 1);
+    }
+}
+
+static NSDictionary *fixNotifs(NSDictionary *rd) {
+    NSMutableDictionary *m = [rd mutableCopy];
+    BOOL changed = NO;
+    NSArray *nullKeys = @[@"unreadFriendsCount", @"unreadFriendsBadgeCount", @"unreadNotificationsCount"];
+    for (NSString *k in nullKeys) {
+        if (!m[k] || m[k] == [NSNull null]) {
+            m[k] = @0;
+            changed = YES;
+        }
+    }
+    if ([m[@"friend_requests"] isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *fr = [m[@"friend_requests"] mutableCopy];
+        if (!fr[@"count_unread"] || fr[@"count_unread"] == [NSNull null]) {
+            fr[@"count_unread"] = @0;
+            changed = YES;
+        }
+        if ([fr[@"users"] isKindOfClass:[NSArray class]]) {
+            NSMutableArray *valid = [NSMutableArray array];
+            for (id u in (NSArray *)fr[@"users"]) {
+                if ([u isKindOfClass:[NSDictionary class]] && [u[@"id"] integerValue] > 0) [valid addObject:u];
+            }
+            fr[@"users"] = valid;
+            changed = YES;
+        }
+        fr[@"count"] = @([fr[@"users"] isKindOfClass:[NSArray class]] ? [(NSArray *)fr[@"users"] count] : 0);
+        m[@"friend_requests"] = fr;
+        changed = YES;
+    }
+    if ([m[@"notifications"] isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *n = [m[@"notifications"] mutableCopy];
+        if ([n[@"items"] isKindOfClass:[NSArray class]] && !n[@"count"]) {
+            n[@"count"] = @([(NSArray *)n[@"items"] count]);
+            changed = YES;
+        }
+        m[@"notifications"] = n;
+    }
+    return changed ? m : nil;
+}
+
 static id normalizeNode(id node, NSInteger depth) {
     if (depth <= 0 || !node) return node;
 
@@ -97,6 +162,23 @@ static id normalizeNode(id node, NSInteger depth) {
     if (![node isKindOfClass:[NSDictionary class]]) return node;
     NSDictionary *d = node;
     NSMutableDictionary *m = nil;
+
+    if (looksLikePhotoDict(d)) {
+        NSNumber *al = d[@"album_id"];
+        NSNumber *aid = d[@"aid"];
+        if ((al && [al integerValue] == 0) || (aid && [aid integerValue] == 0)) {
+            if (!m) m = [d mutableCopy];
+            m[@"album_id"] = @(-7);
+            m[@"aid"] = @(-7);
+        }
+    }
+
+    if ([d[@"post_source"] isKindOfClass:[NSDictionary class]] && [d[@"post_source"][@"type"] isEqualToString:@"api"]) {
+        if (!m) m = [d mutableCopy];
+        NSMutableDictionary *ps = [d[@"post_source"] mutableCopy];
+        ps[@"type"] = @"vk";
+        m[@"post_source"] = ps;
+    }
 
     id sizes = d[@"sizes"];
     if ([sizes isKindOfClass:[NSArray class]] && !d[@"photo_604"] && (d[@"id"] || d[@"pid"]) && (d[@"owner_id"] || d[@"user_id"])) {
@@ -162,6 +244,21 @@ static id normalizeNode(id node, NSInteger depth) {
                 m[@"photo_807"] = u;
             }
         }
+        NSDictionary *cur = m ?: d;
+        if (!cur[@"photo_130"] && [(NSArray *)image count] > 0 && [image[0] isKindOfClass:[NSDictionary class]] && image[0][@"url"]) {
+            if (!m) m = [d mutableCopy];
+            m[@"photo_130"] = image[0][@"url"];
+            cur = m;
+        }
+        if (!cur[@"photo_320"] && cur[@"photo_130"]) {
+            if (!m) m = [d mutableCopy];
+            m[@"photo_320"] = cur[@"photo_130"];
+            cur = m;
+        }
+        if (!cur[@"photo_640"] && cur[@"photo_320"]) {
+            if (!m) m = [d mutableCopy];
+            m[@"photo_640"] = cur[@"photo_320"];
+        }
     }
 
     if (d[@"post_type"] || (d[@"from_id"] && d[@"date"] && d[@"id"] && (d[@"text"] || d[@"attachments"] || d[@"copy_history"]))) {
@@ -179,7 +276,7 @@ static id normalizeNode(id node, NSInteger depth) {
         }
         if (!d[@"post_source"]) {
             if (!m) m = [d mutableCopy];
-            m[@"post_source"] = @{@"type": @"api"};
+            m[@"post_source"] = @{@"type": @"vk"};
         }
         if (!d[@"attachments"]) {
             if (!m) m = [d mutableCopy];
@@ -346,6 +443,12 @@ NSString *rewriteURL(NSString *urlStr) {
     [newUrl replaceOccurrencesOfString:@"method/photos.saveProfilePhoto" withString:@"method/photos.saveOwnerPhoto" options:0 range:NSMakeRange(0, newUrl.length)];
     [newUrl replaceOccurrencesOfString:@"method/messages.getConversations" withString:@"method/messages.getDialogs" options:0 range:NSMakeRange(0, newUrl.length)];
 
+    if ([newUrl containsString:@"method/audio.search"]) {
+        newUrl = [regexReplace(newUrl, @"([?&])search_own=[^&]*", @"$1") mutableCopy];
+        newUrl = [regexReplace(newUrl, @"([?&])auto_complete=[^&]*", @"$1") mutableCopy];
+        newUrl = [regexReplace(newUrl, @"[?&]$", @"") mutableCopy];
+    }
+
     if ([newUrl containsString:@"method/audio.setBroadcast"]) {
         if ([newUrl containsString:@"target="] && ![newUrl containsString:@"target_ids="]) {
             [newUrl replaceOccurrencesOfString:@"target=" withString:@"target_ids=" options:0 range:NSMakeRange(0, newUrl.length)];
@@ -402,12 +505,28 @@ NSString *rewriteURL(NSString *urlStr) {
             decoded = regexReplace(decoded, @"API\\.stats\\.trackEvents\\s*\\([^)]*\\)", @"1");
             decoded = regexReplace(decoded, @"API\\.stats\\.benchmark\\s*\\([^)]*\\)", @"{}");
 
+            decoded = regexReplace(decoded, @"audio:API\\.audio\\.getById\\(\\{audios:\"\\d+\" \\+ audio_id\\}\\)\\[0\\],", @"audio:null,");
+            decoded = regexReplace(decoded, @",filters:\"[^\"]*\"", @"");
+            decoded = regexReplace(decoded, @",filter:\"\"", @"");
+            decoded = regexReplace(decoded, @",filter:filter", @"");
+            decoded = regexReplace(decoded, @"API\\.wall\\.get\\(\\{owner_id:\\d+,filter:\"postponed\",count:1\\}\\)", @"{count:0}");
+            decoded = regexReplace(decoded, @"API\\.account\\.getPingUrl\\([^)]*\\)", @"\"\"");
+            decoded = regexReplace(decoded, @"API\\.account\\.getCommentGroups\\([^)]*\\)", @"false");
+
+            NSError *uidErr = nil;
+            NSRegularExpression *uidRe = [NSRegularExpression regularExpressionWithPattern:@"user_id\"?\\s*:\\s*(\\d+)" options:0 error:&uidErr];
+            NSTextCheckingResult *uidMatch = uidRe ? [uidRe firstMatchInString:decoded options:0 range:NSMakeRange(0, decoded.length)] : nil;
+            if (uidMatch && [uidMatch numberOfRanges] > 1) {
+                NSString *uid = [decoded substringWithRange:[uidMatch rangeAtIndex:1]];
+                NSString *vidStub = [NSString stringWithFormat:@"API.video.get({owner_id:%@,count:1,offset:0})", uid];
+                decoded = regexReplace(decoded, @"API\\.video\\.getAlbums\\s*\\([^)]*\\)", vidStub);
+                decoded = regexReplace(decoded, @"API\\.video\\.getAlbumById\\s*\\([^)]*\\)", vidStub);
+            }
+
             if (isVK3()) {
                 decoded = regexReplace(decoded, @"API\\.internal\\.getUserNotifications\\s*\\([^)]*\\)", @"API.notifications.get({count:50, extended:1})");
             } else {
                 decoded = regexReplace(decoded, @"API\\.internal\\.getUserNotifications\\s*\\([^)]*\\)", @"{count:0, items:[]}");
-                decoded = regexReplace(decoded, @"API\\.video\\.getAlbums\\s*\\([^)]*\\)", @"{count:0, items:[]}");
-                decoded = regexReplace(decoded, @"API\\.video\\.getAlbumById\\s*\\([^)]*\\)", @"{count:0, items:[]}");
             }
 
             if (g_lastPhotoId && g_lastPhotoOwnerId) {
@@ -570,6 +689,23 @@ NSString *rewriteURL(NSString *urlStr) {
             lastUploadPhoto = outer[@"photo"];
         }
 
+        id err = outer[@"error"];
+        if ([err isKindOfClass:[NSDictionary class]] && [err[@"error_code"] integerValue] == 3) {
+            NSString *method = nil;
+            for (id p in err[@"request_params"]) {
+                if ([p isKindOfClass:[NSDictionary class]] && [p[@"key"] isEqualToString:@"method"]) method = p[@"value"];
+            }
+            if ([method isEqualToString:@"audio.getSearchTrends"] || [method isEqualToString:@"audio.getHints"]) {
+                return @{@"response": @{@"items": @[], @"count": @0}};
+            }
+            if ([method isEqualToString:@"account.getPingUrl"]) {
+                return @{@"response": @""};
+            }
+            if ([method isEqualToString:@"account.getCommentGroups"]) {
+                return @{@"response": @NO};
+            }
+        }
+
         id deduped = dedupeUpdates(outer);
         if (deduped) outer = deduped;
 
@@ -610,6 +746,21 @@ NSString *rewriteURL(NSString *urlStr) {
                     NSLog(@"[OpenGate] Injected %lu profiles into dialogs", (unsigned long)profiles.count);
                 }
                 g_expectDialogs = NO;
+            }
+
+            NSDictionary *nf = fixNotifs(mrd ?: rd);
+            if (nf) mrd = [nf mutableCopy];
+
+            collectAudio(mrd ?: rd, 8);
+
+            NSDictionary *cur = mrd ?: rd;
+            if (cur[@"audio_id"] && !cur[@"audio"]) {
+                id cached = g_audioCache[[cur[@"audio_id"] description]];
+                if (cached) {
+                    if (!mrd) mrd = [rd mutableCopy];
+                    mrd[@"audio"] = cached;
+                    mrd[@"audio_id"] = cached[@"id"];
+                }
             }
 
             id normalized = normalizeNode(mrd ?: rd, 8);
