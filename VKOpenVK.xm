@@ -105,10 +105,10 @@ static void collectAudio(id node, NSInteger depth) {
 }
 
 static NSDictionary *fixNotifs(NSDictionary *rd) {
+    if (!rd[@"notifications"] && !rd[@"friend_requests"]) return nil;
     NSMutableDictionary *m = [rd mutableCopy];
     BOOL changed = NO;
-    NSArray *nullKeys = @[@"unreadFriendsCount", @"unreadFriendsBadgeCount", @"unreadNotificationsCount"];
-    for (NSString *k in nullKeys) {
+    for (NSString *k in @[@"unreadFriendsCount", @"unreadFriendsBadgeCount", @"unreadNotificationsCount"]) {
         if (!m[k] || m[k] == [NSNull null]) {
             m[k] = @0;
             changed = YES;
@@ -120,17 +120,7 @@ static NSDictionary *fixNotifs(NSDictionary *rd) {
             fr[@"count_unread"] = @0;
             changed = YES;
         }
-        if ([fr[@"users"] isKindOfClass:[NSArray class]]) {
-            NSMutableArray *valid = [NSMutableArray array];
-            for (id u in (NSArray *)fr[@"users"]) {
-                if ([u isKindOfClass:[NSDictionary class]] && [u[@"id"] integerValue] > 0) [valid addObject:u];
-            }
-            fr[@"users"] = valid;
-            changed = YES;
-        }
-        fr[@"count"] = @([fr[@"users"] isKindOfClass:[NSArray class]] ? [(NSArray *)fr[@"users"] count] : 0);
         m[@"friend_requests"] = fr;
-        changed = YES;
     }
     if ([m[@"notifications"] isKindOfClass:[NSDictionary class]]) {
         NSMutableDictionary *n = [m[@"notifications"] mutableCopy];
@@ -506,12 +496,6 @@ NSString *rewriteURL(NSString *urlStr) {
             decoded = regexReplace(decoded, @"API\\.stats\\.benchmark\\s*\\([^)]*\\)", @"{}");
 
             decoded = regexReplace(decoded, @"audio:API\\.audio\\.getById\\(\\{audios:\"\\d+\" \\+ audio_id\\}\\)\\[0\\],", @"audio:null,");
-            decoded = regexReplace(decoded, @",filters:\"[^\"]*\"", @"");
-            decoded = regexReplace(decoded, @",filter:\"\"", @"");
-            decoded = regexReplace(decoded, @",filter:filter", @"");
-            decoded = regexReplace(decoded, @"API\\.wall\\.get\\(\\{owner_id:\\d+,filter:\"postponed\",count:1\\}\\)", @"{count:0}");
-            decoded = regexReplace(decoded, @"API\\.account\\.getPingUrl\\([^)]*\\)", @"\"\"");
-            decoded = regexReplace(decoded, @"API\\.account\\.getCommentGroups\\([^)]*\\)", @"false");
 
             NSError *uidErr = nil;
             NSRegularExpression *uidRe = [NSRegularExpression regularExpressionWithPattern:@"user_id\"?\\s*:\\s*(\\d+)" options:0 error:&uidErr];
