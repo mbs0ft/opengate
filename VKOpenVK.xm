@@ -15,6 +15,7 @@ static NSMutableDictionary *g_audioCache = nil;
 static NSString *g_audioUserId = nil;
 static BOOL g_expectSaveWallPhoto = NO;
 static BOOL g_expectDialogs = NO;
+static BOOL g_expectHints = NO;
 static BOOL g_isVK3 = NO;
 static BOOL g_versionChecked = NO;
 
@@ -440,6 +441,16 @@ NSString *rewriteURL(NSString *urlStr) {
         newUrl = [regexReplace(newUrl, @"[?&]$", @"") mutableCopy];
     }
 
+    if ([newUrl containsString:@"method/search.getHints"]) {
+        g_expectHints = YES;
+    }
+
+    if ([newUrl containsString:@"method/newsfeed.getDiscover"]) {
+        [newUrl replaceOccurrencesOfString:@"method/newsfeed.getDiscover" withString:@"method/newsfeed.get" options:0 range:NSMakeRange(0, newUrl.length)];
+        newUrl = [regexReplace(newUrl, @"([?&])(intent|templates)=[^&]*", @"$1") mutableCopy];
+        newUrl = [regexReplace(newUrl, @"[?&]$", @"") mutableCopy];
+    }
+
     if ([newUrl containsString:@"method/audio.setBroadcast"]) {
         if ([newUrl containsString:@"target="] && ![newUrl containsString:@"target_ids="]) {
             [newUrl replaceOccurrencesOfString:@"target=" withString:@"target_ids=" options:0 range:NSMakeRange(0, newUrl.length)];
@@ -472,30 +483,28 @@ NSString *rewriteURL(NSString *urlStr) {
         g_expectDialogs = YES;
     }
 
-        if ([newUrl containsString:@"method/execute"]) {
+    if ([newUrl containsString:@"method/execute"]) {
         NSRange qRange = [newUrl rangeOfString:@"?"];
         if (qRange.location != NSNotFound) {
             NSString *base = [newUrl substringToIndex:qRange.location + 1];
             NSString *query = [newUrl substringFromIndex:qRange.location + 1];
-            
-            // Находим code= в query
+
             NSRange codeStart = [query rangeOfString:@"code="];
             if (codeStart.location != NSNotFound) {
                 NSUInteger codeValueStart = codeStart.location + codeStart.length;
                 NSRange ampRange = [query rangeOfString:@"&" options:0 range:NSMakeRange(codeValueStart, query.length - codeValueStart)];
-                
+
                 NSString *beforeCode = [query substringToIndex:codeValueStart];
                 NSString *afterCode = @"";
                 NSString *encodedCodeValue;
-                
+
                 if (ampRange.location == NSNotFound) {
                     encodedCodeValue = [query substringFromIndex:codeValueStart];
                 } else {
                     encodedCodeValue = [query substringWithRange:NSMakeRange(codeValueStart, ampRange.location - codeValueStart)];
                     afterCode = [query substringFromIndex:ampRange.location];
                 }
-                
-                // Декодируем ТОЛЬКО значение code
+
                 NSString *decoded = [encodedCodeValue stringByRemovingPercentEncoding];
                 if (!decoded) decoded = encodedCodeValue;
                 NSString *original = decoded;
@@ -554,7 +563,6 @@ NSString *rewriteURL(NSString *urlStr) {
                 }
 
                 if (![decoded isEqualToString:original]) {
-                    // Кодируем обратно, ИСКЛЮЧАЯ & и = из allowed set
                     NSMutableCharacterSet *cs = [[NSCharacterSet URLQueryAllowedCharacterSet] mutableCopy];
                     [cs removeCharactersInString:@"&="];
                     NSString *encoded = [decoded stringByAddingPercentEncodingWithAllowedCharacters:cs];
@@ -734,12 +742,26 @@ NSString *rewriteURL(NSString *urlStr) {
             if ([method isEqualToString:@"account.getCommentGroups"]) {
                 return @{@"response": @NO};
             }
+            if ([method isEqualToString:@"search.getTrends"]) {
+                return @{@"response": @{@"count": @0, @"items": @[]}};
+            }
+            if ([method isEqualToString:@"newsfeed.getComments"]) {
+                return @{@"response": @{@"count": @0, @"items": @[], @"profiles": @[], @"groups": @[]}};
+            }
+            if ([method isEqualToString:@"newsfeed.getPromotionLists"]) {
+                return @{@"response": @{@"items": @[]}};
+            }
         }
 
         id deduped = dedupeUpdates(outer);
         if (deduped) outer = deduped;
 
         id resp = outer[@"response"];
+
+        if (g_expectHints && [resp isKindOfClass:[NSArray class]]) {
+            g_expectHints = NO;
+            return @{@"response": @{@"count": @([(NSArray *)resp count]), @"items": resp}};
+        }
 
         if (g_expectSaveWallPhoto && [resp isKindOfClass:[NSArray class]]) {
             NSArray *arr = resp;
@@ -761,12 +783,37 @@ NSString *rewriteURL(NSString *urlStr) {
                 mrd[@"count"] = @([(NSArray *)rd[@"items"] count]);
             }
 
+            if (g_expectDialogs && [rd[@"items"] isKindOfClass:[NSArray class]]) {
+                NSArray *items = rd[@"items"];
+                if (items.count > 0 && [items[0] isKindOfClass:[NSDictionary class]] && items[0][@"body"] && !items[0][@"message"]) {
+                    NSMutableArray *wrapped = [NSMutableArray array];
+                    for (NSDictionary *msg in items) {
+                        if (msg[@"message"]) { [wrapped addObject:msg]; continue; }
+                        BOOL out = [msg[@"out"] boolValue];
+                        BOOL read = [msg[@"read_state"] boolValue];
+                        [wrapped addObject:@{
+                            @"message": msg,
+                            @"unread": @((!out && !read) ? 1 : 0),
+                            @"in_read": @((!out && read) ? [msg[@"id"] integerValue] : 0),
+                            @"out_read": @((out && read) ? [msg[@"id"] integerValue] : 0)
+                        }];
+                    }
+                    if (!mrd) mrd = [rd mutableCopy];
+                    mrd[@"items"] = wrapped;
+                    NSLog(@"[OpenGate] dialogs wrapped n=%lu", (unsigned long)wrapped.count);
+                }
+            }
+
             if (g_expectDialogs && looksLikeDialogs(rd) && !rd[@"profiles"]) {
                 if (!mrd) mrd = [rd mutableCopy];
                 NSMutableSet *userIds = [NSMutableSet set];
                 for (id item in rd[@"items"]) {
                     if (![item isKindOfClass:[NSDictionary class]]) continue;
-                    NSNumber *uid = item[@"user_id"];
+                    NSDictionary *msg = item;
+                    if ([item isKindOfClass:[NSDictionary class]] && item[@"message"]) {
+                        msg = item[@"message"];
+                    }
+                    NSNumber *uid = msg[@"user_id"];
                     if (uid && [uid integerValue] > 0) [userIds addObject:[uid description]];
                 }
                 NSArray *profiles = fetchProfilesForIds(userIds);
