@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
 #import <string.h>
 
 static NSString *kOwnerID = @"674";
@@ -12,7 +13,11 @@ static NSString *g_lastPhotoId = nil;
 static NSString *g_lastPhotoOwnerId = nil;
 static NSDictionary *g_savedWallPhotoDict = nil;
 static NSMutableDictionary *g_audioCache = nil;
+static NSMutableDictionary *g_videoCache = nil;
 static NSString *g_audioUserId = nil;
+static NSString *g_selfId = nil;
+static NSString *g_pendingVideoKey = nil;
+static NSMutableSet *g_titleViews = nil;
 static BOOL g_expectSaveWallPhoto = NO;
 static BOOL g_expectDialogs = NO;
 static BOOL g_expectHints = NO;
@@ -32,6 +37,9 @@ static BOOL g_versionChecked = NO;
 - (void)setHasPhotoSizes:(BOOL)flag;
 @end
 
+@interface LayoutAwareView : UIView
+@end
+
 NSString *regexReplace(NSString *str, NSString *pattern, NSString *replacement) {
     if (!str) return str;
     NSError *error = nil;
@@ -43,6 +51,48 @@ NSString *regexReplace(NSString *str, NSString *pattern, NSString *replacement) 
                                            options:0
                                              range:NSMakeRange(0, str.length)
                                       withTemplate:replacement];
+}
+
+static NSString *firstGroup(NSString *str, NSString *pattern) {
+    if (!str) return nil;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern options:0 error:nil];
+    if (!re) return nil;
+    NSTextCheckingResult *m = [re firstMatchInString:str options:0 range:NSMakeRange(0, str.length)];
+    if (!m || m.numberOfRanges < 2) return nil;
+    NSRange r = [m rangeAtIndex:1];
+    if (r.location == NSNotFound) return nil;
+    return [str substringWithRange:r];
+}
+
+static NSString *rewriteInner(NSString *str, NSString *pattern, NSString *(^fix)(NSString *)) {
+    if (!str) return str;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pattern options:0 error:nil];
+    if (!re) return str;
+    NSArray *ms = [re matchesInString:str options:0 range:NSMakeRange(0, str.length)];
+    if (ms.count == 0) return str;
+    NSMutableString *out = [str mutableCopy];
+    for (NSInteger i = (NSInteger)ms.count - 1; i >= 0; i--) {
+        NSTextCheckingResult *m = ms[i];
+        if (m.numberOfRanges < 2) continue;
+        NSRange whole = [m rangeAtIndex:0];
+        NSRange inner = [m rangeAtIndex:1];
+        if (inner.location == NSNotFound) continue;
+        NSString *arg = [str substringWithRange:inner];
+        NSString *fixed = fix(arg);
+        if (fixed) [out replaceCharactersInRange:whole withString:fixed];
+    }
+    return out;
+}
+
+static NSString *encodeExecuteCode(NSString *code) {
+    NSMutableCharacterSet *cs = [[NSCharacterSet URLQueryAllowedCharacterSet] mutableCopy];
+    [cs removeCharactersInString:@"&="];
+    NSString *e = [code stringByAddingPercentEncodingWithAllowedCharacters:cs];
+    if (!e) return code;
+    e = [e stringByReplacingOccurrencesOfString:@"+" withString:@"%2B"];
+    e = [e stringByReplacingOccurrencesOfString:@"&" withString:@"%26"];
+    e = [e stringByReplacingOccurrencesOfString:@"=" withString:@"%3D"];
+    return e;
 }
 
 static BOOL isVK3(void) {
@@ -77,7 +127,6 @@ static void cacheTokenFromURL(NSString *urlStr) {
         cachedToken = token;
         [[NSUserDefaults standardUserDefaults] setObject:token forKey:@"opengate_cached_token"];
         [[NSUserDefaults standardUserDefaults] synchronize];
-        NSLog(@"[OpenGate] Cached access_token (length=%lu)", (unsigned long)token.length);
     }
 }
 
@@ -103,6 +152,25 @@ static void collectAudio(id node, NSInteger depth) {
     for (NSString *k in d) {
         id v = d[k];
         if ([v isKindOfClass:[NSDictionary class]] || [v isKindOfClass:[NSArray class]]) collectAudio(v, depth - 1);
+    }
+}
+
+static void cacheVideos(id node, NSInteger depth) {
+    if (depth <= 0 || !node) return;
+    if ([node isKindOfClass:[NSArray class]]) {
+        for (id v in (NSArray *)node) cacheVideos(v, depth - 1);
+        return;
+    }
+    if (![node isKindOfClass:[NSDictionary class]]) return;
+    NSDictionary *d = node;
+    if (d[@"id"] && d[@"owner_id"] && d[@"player"]) {
+        if (!g_videoCache) g_videoCache = [NSMutableDictionary dictionary];
+        NSString *key = [NSString stringWithFormat:@"%@_%@", d[@"owner_id"], d[@"id"]];
+        g_videoCache[key] = d;
+    }
+    for (NSString *k in d) {
+        id v = d[k];
+        if ([v isKindOfClass:[NSDictionary class]] || [v isKindOfClass:[NSArray class]]) cacheVideos(v, depth - 1);
     }
 }
 
@@ -354,10 +422,39 @@ static id dedupeUpdates(NSDictionary *outer) {
         [kept addObject:ev];
     }
     if (!changed) return nil;
-    NSLog(@"[OpenGate] Longpoll dedupe: dropped duplicates, kept %lu", (unsigned long)kept.count);
     NSMutableDictionary *copy = [outer mutableCopy];
     copy[@"updates"] = kept;
     return copy;
+}
+
+static void centerTitleChildren(UIView *tv) {
+    if (!tv) return;
+    CGFloat W = tv.frame.size.width;
+    if (W <= 0) return;
+    for (UIView *s in tv.subviews) {
+        CGFloat w = s.frame.size.width;
+        if (w <= 0 || w >= W) continue;
+        CGFloat nx = (W - w) / 2.0;
+        if (fabs(s.frame.origin.x - nx) > 0.5) {
+            CGRect f = s.frame;
+            f.origin.x = nx;
+            s.frame = f;
+        }
+    }
+}
+
+static void markTitleView(UIViewController *vc) {
+    if (!vc) return;
+    NSString *cn = NSStringFromClass([vc class]);
+    if (!cn) return;
+    if ([cn rangeOfString:@"Chat"].location == NSNotFound && [cn rangeOfString:@"Dialog"].location == NSNotFound) return;
+    UINavigationItem *ni = [vc navigationItem];
+    if (!ni) return;
+    UIView *tv = ni.titleView;
+    if (!tv) return;
+    if (!g_titleViews) g_titleViews = [NSMutableSet set];
+    [g_titleViews addObject:[NSString stringWithFormat:@"%p", tv]];
+    centerTitleChildren(tv);
 }
 
 @interface UIViewController (OpenGateAdditions)
@@ -435,6 +532,14 @@ NSString *rewriteURL(NSString *urlStr) {
     [newUrl replaceOccurrencesOfString:@"method/photos.saveProfilePhoto" withString:@"method/photos.saveOwnerPhoto" options:0 range:NSMakeRange(0, newUrl.length)];
     [newUrl replaceOccurrencesOfString:@"method/messages.getConversations" withString:@"method/messages.getDialogs" options:0 range:NSMakeRange(0, newUrl.length)];
 
+    if ([newUrl containsString:@"method/video."]) {
+        newUrl = [regexReplace(newUrl, @"([?&])user_id=(\\d+)", @"$1owner_id=$2") mutableCopy];
+        newUrl = [regexReplace(newUrl, @"([?&])videos=(-?\\d+)_(\\d+)", @"$1owner_id=$2&video_id=$3") mutableCopy];
+        NSString *o = paramValue(newUrl, @"owner_id");
+        NSString *v = paramValue(newUrl, @"video_id");
+        if (o && v) g_pendingVideoKey = [NSString stringWithFormat:@"%@_%@", o, v];
+    }
+
     if ([newUrl containsString:@"method/audio.search"]) {
         newUrl = [regexReplace(newUrl, @"([?&])search_own=[^&]*", @"$1") mutableCopy];
         newUrl = [regexReplace(newUrl, @"([?&])auto_complete=[^&]*", @"$1") mutableCopy];
@@ -456,6 +561,25 @@ NSString *rewriteURL(NSString *urlStr) {
             [newUrl replaceOccurrencesOfString:@"target=" withString:@"target_ids=" options:0 range:NSMakeRange(0, newUrl.length)];
         } else if (![newUrl containsString:@"target_ids="]) {
             [newUrl appendFormat:@"&target_ids=%@", kOwnerID];
+        }
+    }
+
+    if ([newUrl containsString:@"method/messages.getChatUsers"]) {
+        NSString *cid = paramValue(newUrl, @"chat_id");
+        if (cid) {
+            NSString *fields = paramValue(newUrl, @"fields");
+            if (!fields) fields = @"photo_100,sex,online";
+            NSString *code = [NSString stringWithFormat:@"var c = API.messages.getChat({\"chat_id\":%@});return API.users.get({user_ids:c.users,fields:\"%@\"});", cid, fields];
+            NSRange q = [newUrl rangeOfString:@"?"];
+            NSString *base = q.location != NSNotFound ? [newUrl substringToIndex:q.location] : (NSString *)newUrl;
+            base = [base stringByReplacingOccurrencesOfString:@"method/messages.getChatUsers" withString:@"method/execute"];
+            NSMutableString *built = [NSMutableString stringWithFormat:@"%@?code=%@", base, encodeExecuteCode(code)];
+            NSString *tok = paramValue(newUrl, @"access_token");
+            if (tok) [built appendFormat:@"&access_token=%@", tok];
+            [built appendString:@"&v=5.75"];
+            NSString *lang = paramValue(newUrl, @"lang");
+            if (lang) [built appendFormat:@"&lang=%@", lang];
+            newUrl = built;
         }
     }
 
@@ -509,6 +633,11 @@ NSString *rewriteURL(NSString *urlStr) {
                 if (!decoded) decoded = encodedCodeValue;
                 NSString *original = decoded;
 
+                if ([decoded containsString:@"account.setOnline"]) {
+                    NSString *sid = firstGroup(decoded, @"user_ids:(\\d+)");
+                    if (sid) g_selfId = sid;
+                }
+
                 decoded = regexReplace(decoded, @"API\\.execute\\.newsfeed\\s*\\([^)]*\\)", @"API.newsfeed.get({count:20, filters:\"post,photo\", extended:1})");
                 decoded = regexReplace(decoded, @"API\\.execute\\.newsfeedUpdateTimeout\\s*\\([^)]*\\)", @"0");
                 decoded = regexReplace(decoded, @"API\\.internal\\.getSituationalSuggest\\s*\\([^)]*\\)", @"{items:[]}");
@@ -529,14 +658,65 @@ NSString *rewriteURL(NSString *urlStr) {
                 decoded = regexReplace(decoded, @",filter:\"\"", @"");
                 decoded = regexReplace(decoded, @",filter:filter", @"");
 
-                NSError *uidErr = nil;
-                NSRegularExpression *uidRe = [NSRegularExpression regularExpressionWithPattern:@"user_id\"?\\s*:\\s*(\\d+)" options:0 error:&uidErr];
-                NSTextCheckingResult *uidMatch = uidRe ? [uidRe firstMatchInString:decoded options:0 range:NSMakeRange(0, decoded.length)] : nil;
-                if (uidMatch && [uidMatch numberOfRanges] > 1) {
-                    NSString *uid = [decoded substringWithRange:[uidMatch rangeAtIndex:1]];
+                decoded = rewriteInner(decoded, @"API\\.video\\.get\\(\\{([^}]*)\\}\\)", ^NSString *(NSString *inner) {
+                    NSString *vids = firstGroup(inner, @"\"videos\":\"(-?\\d+_\\d+(?:_[0-9a-zA-Z]+)?)\"");
+                    if (vids) {
+                        NSArray *parts = [vids componentsSeparatedByString:@"_"];
+                        if (parts.count < 2) return nil;
+                        g_pendingVideoKey = [NSString stringWithFormat:@"%@_%@", parts[0], parts[1]];
+                        NSString *needle = [NSString stringWithFormat:@"\"videos\":\"%@\"", vids];
+                        NSString *rest = [inner stringByReplacingOccurrencesOfString:needle withString:@""];
+                        if ([rest hasPrefix:@","]) rest = [rest substringFromIndex:1];
+                        NSMutableString *ni = [NSMutableString stringWithFormat:@"\"owner_id\":%@,\"video_id\":%@", parts[0], parts[1]];
+                        if (parts.count > 2) [ni appendFormat:@",\"access_key\":\"%@\"", parts[2]];
+                        if (rest.length) [ni appendFormat:@",%@", rest];
+                        return [NSString stringWithFormat:@"API.video.get({%@})", ni];
+                    }
+                    NSString *o = firstGroup(inner, @"\"owner_id\":(-?\\d+)");
+                    NSString *v = firstGroup(inner, @"\"video_id\":(\\d+)");
+                    if (o && v) g_pendingVideoKey = [NSString stringWithFormat:@"%@_%@", o, v];
+                    if ([inner containsString:@"owner_id"]) return nil;
+                    if (![inner containsString:@"\"user_id\""]) return nil;
+                    NSString *ni = [inner stringByReplacingOccurrencesOfString:@"\"user_id\":" withString:@"\"owner_id\":"];
+                    return [NSString stringWithFormat:@"API.video.get({%@})", ni];
+                });
+
+                NSString *uid = firstGroup(decoded, @"(?:user_id|owner_id)\"?\\s*:\\s*(\\d+)");
+                if (uid) {
                     NSString *vidStub = [NSString stringWithFormat:@"API.video.get({owner_id:%@,count:1,offset:0})", uid];
                     decoded = regexReplace(decoded, @"API\\.video\\.getAlbums\\s*\\([^)]*\\)", vidStub);
                     decoded = regexReplace(decoded, @"API\\.video\\.getAlbumById\\s*\\([^)]*\\)", vidStub);
+                }
+
+                decoded = regexReplace(decoded, @"API\\.video\\.getAlbumsByVideo\\s*\\([^)]*\\)", @"{count:0,items:[]}");
+
+                decoded = rewriteInner(decoded, @"API\\.likes\\.isLiked\\(\\{([^}]*)\\}\\)", ^NSString *(NSString *inner) {
+                    if ([inner containsString:@"user_id"]) return nil;
+                    if (g_selfId) {
+                        return [NSString stringWithFormat:@"API.likes.isLiked({user_id:%@,%@})", g_selfId, inner];
+                    }
+                    return @"{liked:0}";
+                });
+
+                decoded = rewriteInner(decoded, @"API\\.notifications\\.get\\(\\{([^}]*)\\}\\)", ^NSString *(NSString *inner) {
+                    if ([inner containsString:@"extended"]) return nil;
+                    return [NSString stringWithFormat:@"API.notifications.get({extended:1,%@})", inner];
+                });
+
+                decoded = regexReplace(decoded, @"inviters:API\\.users\\.get\\(\\{[^}]*\\}\\)", @"inviters:[]");
+
+                NSString *cuArgs = firstGroup(decoded, @"API\\.messages\\.getChatUsers\\(\\{([^}]*)\\}\\)");
+                if (cuArgs) {
+                    NSString *cid = firstGroup(cuArgs, @"\"chat_id\":(\\d+)");
+                    if (cid) {
+                        NSString *fields = firstGroup(cuArgs, @"\"fields\":\"([^\"]*)\"");
+                        if (!fields) fields = @"photo_100,sex,online";
+                        NSString *repl = [NSString stringWithFormat:@"API.users.get({user_ids:__chat.users,fields:\"%@\"})", fields];
+                        decoded = rewriteInner(decoded, @"API\\.messages\\.getChatUsers\\(\\{([^}]*)\\}\\)", ^NSString *(NSString *inner) {
+                            return repl;
+                        });
+                        decoded = [NSString stringWithFormat:@"var __chat = API.messages.getChat({\"chat_id\":%@});%@", cid, decoded];
+                    }
                 }
 
                 if (isVK3()) {
@@ -555,7 +735,6 @@ NSString *rewriteURL(NSString *urlStr) {
                             NSString *tail = [NSString stringWithFormat:@",\"attachments\":\"photo%@_%@\"}", g_lastPhotoOwnerId, g_lastPhotoId];
                             NSString *newJson = [wallJson stringByReplacingCharactersInRange:NSMakeRange(wallJson.length - 1, 1) withString:tail];
                             decoded = [decoded stringByReplacingCharactersInRange:jsonRange withString:newJson];
-                            NSLog(@"[OpenGate] Injected attachments into wall.post: photo%@_%@", g_lastPhotoOwnerId, g_lastPhotoId);
                             g_lastPhotoId = nil;
                             g_lastPhotoOwnerId = nil;
                         }
@@ -563,11 +742,7 @@ NSString *rewriteURL(NSString *urlStr) {
                 }
 
                 if (![decoded isEqualToString:original]) {
-                    NSMutableCharacterSet *cs = [[NSCharacterSet URLQueryAllowedCharacterSet] mutableCopy];
-                    [cs removeCharactersInString:@"&="];
-                    NSString *encoded = [decoded stringByAddingPercentEncodingWithAllowedCharacters:cs];
-                    encoded = [encoded stringByReplacingOccurrencesOfString:@"+" withString:@"%2B"];
-                    encoded = [encoded stringByReplacingOccurrencesOfString:@"&&" withString:@"%26%26"];
+                    NSString *encoded = encodeExecuteCode(decoded);
                     newUrl = [[base stringByAppendingString:beforeCode] mutableCopy];
                     [newUrl appendString:encoded];
                     [newUrl appendString:afterCode];
@@ -612,11 +787,11 @@ NSString *rewriteURL(NSString *urlStr) {
 
 - (instancetype)initWithURL:(NSURL *)URL cachePolicy:(NSURLRequestCachePolicy)cachePolicy timeoutInterval:(NSTimeInterval)timeoutInterval {
     NSString *urlStr = [URL absoluteString];
-    
-    if ([urlStr containsString:@"method/execute"] && 
-        [urlStr containsString:@"wall.post"] && 
+
+    if ([urlStr containsString:@"method/execute"] &&
+        [urlStr containsString:@"wall.post"] &&
         ![urlStr containsString:@"attachments"]) {
-        
+
         if (g_lastPhotoId && g_lastPhotoOwnerId) {
             NSString *modified = rewriteURL(urlStr);
             if (modified && [modified containsString:@"attachments"]) {
@@ -624,18 +799,13 @@ NSString *rewriteURL(NSString *urlStr) {
                 return %orig(newURL, cachePolicy, timeoutInterval);
             }
         }
-        
-        NSLog(@"[OpenGate] >>> Blocked wall.post without attachments <<<");
+
         NSURL *fakeURL = [NSURL URLWithString:@"https://openvk.org/method/dummy"];
         return %orig(fakeURL, cachePolicy, timeoutInterval);
     }
-    
+
     return %orig;
 }
-
-%end
-
-%hook NSMutableURLRequest
 
 - (instancetype)initWithURL:(NSURL *)URL {
     NSString *urlStr = [URL absoluteString];
@@ -655,22 +825,8 @@ NSString *rewriteURL(NSString *urlStr) {
         NSString *bodyStr = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
         if (bodyStr) {
             cacheTokenFromURL(bodyStr);
-            
-            NSRange ownerRange = [bodyStr rangeOfString:@"owner_id="];
-            if (ownerRange.location != NSNotFound) {
-                NSUInteger start = ownerRange.location + 9;
-                NSRange ampRange = [bodyStr rangeOfString:@"&" options:0 range:NSMakeRange(start, bodyStr.length - start)];
-                NSString *ownerId;
-                if (ampRange.location == NSNotFound) {
-                    ownerId = [bodyStr substringFromIndex:start];
-                } else {
-                    ownerId = [bodyStr substringWithRange:NSMakeRange(start, ampRange.location - start)];
-                }
-                ownerId = [ownerId stringByRemovingPercentEncoding];
-                if (ownerId && ownerId.length > 0) {
-                    g_audioUserId = ownerId;
-                }
-            }
+            NSString *oid = paramValue(bodyStr, @"owner_id");
+            if (oid.length > 0) g_audioUserId = oid;
         }
     }
 
@@ -751,10 +907,15 @@ NSString *rewriteURL(NSString *urlStr) {
             if ([method isEqualToString:@"newsfeed.getPromotionLists"]) {
                 return @{@"response": @{@"items": @[]}};
             }
+            if ([method isEqualToString:@"video.getAlbumsByVideo"]) {
+                return @{@"response": @{@"count": @0, @"items": @[]}};
+            }
         }
 
         id deduped = dedupeUpdates(outer);
         if (deduped) outer = deduped;
+
+        cacheVideos(outer, 8);
 
         id resp = outer[@"response"];
 
@@ -769,7 +930,6 @@ NSString *rewriteURL(NSString *urlStr) {
                 g_lastPhotoId = [(arr[0][@"id"] ?: arr[0][@"pid"]) description];
                 g_lastPhotoOwnerId = [arr[0][@"owner_id"] description];
                 g_expectSaveWallPhoto = NO;
-                NSLog(@"[OpenGate] saveWallPhoto converted, photo=%@_%@", g_lastPhotoOwnerId, g_lastPhotoId);
                 return @{ @"response": arr[0] };
             }
         }
@@ -778,9 +938,23 @@ NSString *rewriteURL(NSString *urlStr) {
             NSDictionary *rd = resp;
             NSMutableDictionary *mrd = nil;
 
+            if ([rd[@"user"] isKindOfClass:[NSDictionary class]] && rd[@"user"][@"id"]) {
+                g_selfId = [rd[@"user"][@"id"] description];
+            }
+
             if (rd[@"items"] && !rd[@"count"]) {
                 mrd = [rd mutableCopy];
                 mrd[@"count"] = @([(NSArray *)rd[@"items"] count]);
+            }
+
+            if ([rd[@"item"] isKindOfClass:[NSDictionary class]]) {
+                NSDictionary *item = rd[@"item"];
+                if (item[@"video"] && g_pendingVideoKey && g_videoCache[g_pendingVideoKey]) {
+                    if (!mrd) mrd = [rd mutableCopy];
+                    NSMutableDictionary *mi = [item mutableCopy];
+                    mi[@"video"] = g_videoCache[g_pendingVideoKey];
+                    mrd[@"item"] = mi;
+                }
             }
 
             if (g_expectDialogs && [rd[@"items"] isKindOfClass:[NSArray class]]) {
@@ -800,7 +974,6 @@ NSString *rewriteURL(NSString *urlStr) {
                     }
                     if (!mrd) mrd = [rd mutableCopy];
                     mrd[@"items"] = wrapped;
-                    NSLog(@"[OpenGate] dialogs wrapped n=%lu", (unsigned long)wrapped.count);
                 }
             }
 
@@ -810,9 +983,7 @@ NSString *rewriteURL(NSString *urlStr) {
                 for (id item in rd[@"items"]) {
                     if (![item isKindOfClass:[NSDictionary class]]) continue;
                     NSDictionary *msg = item;
-                    if ([item isKindOfClass:[NSDictionary class]] && item[@"message"]) {
-                        msg = item[@"message"];
-                    }
+                    if (item[@"message"]) msg = item[@"message"];
                     NSNumber *uid = msg[@"user_id"];
                     if (uid && [uid integerValue] > 0) [userIds addObject:[uid description]];
                 }
@@ -820,7 +991,6 @@ NSString *rewriteURL(NSString *urlStr) {
                 if (profiles) {
                     mrd[@"profiles"] = profiles;
                     mrd[@"groups"] = @[];
-                    NSLog(@"[OpenGate] Injected %lu profiles into dialogs", (unsigned long)profiles.count);
                 }
                 g_expectDialogs = NO;
             }
@@ -834,22 +1004,15 @@ NSString *rewriteURL(NSString *urlStr) {
             if (cur[@"audio_id"] && (cur[@"audio"] == nil || cur[@"audio"] == [NSNull null])) {
                 NSString *audioIdStr = [cur[@"audio_id"] description];
                 NSArray *parts = [audioIdStr componentsSeparatedByString:@"_"];
-                
                 if (parts.count == 2) {
-                    NSString *ownerId = parts[0];
-                    NSString *trackId = parts[1];
-                    NSString *cacheKey = [NSString stringWithFormat:@"%@_%@", ownerId, trackId];
-                    
+                    NSString *cacheKey = [NSString stringWithFormat:@"%@_%@", parts[0], parts[1]];
                     id cached = g_audioCache[cacheKey];
                     if (cached) {
                         if (!mrd) mrd = [rd mutableCopy];
                         NSMutableDictionary *cachedCopy = [cached mutableCopy];
-                        if (g_audioUserId) {
-                            cachedCopy[@"owner_id"] = g_audioUserId;
-                        }
+                        if (g_audioUserId) cachedCopy[@"owner_id"] = g_audioUserId;
                         mrd[@"audio"] = cachedCopy;
-                        mrd[@"audio_id"] = @([trackId longLongValue]);
-                        NSLog(@"[OpenGate] Injected cached audio %@, owner=%@, audio_id=%@", trackId, cachedCopy[@"owner_id"], mrd[@"audio_id"]);
+                        mrd[@"audio_id"] = @([parts[1] longLongValue]);
                     }
                 }
             }
@@ -905,7 +1068,6 @@ NSString *rewriteURL(NSString *urlStr) {
             m[@"album_id"] = @(-7);
             m[@"aid"] = @(-7);
             dict = m;
-            NSLog(@"[OpenGate] VKPhoto album -> -7");
         }
     }
     %orig(dict, context);
@@ -925,21 +1087,18 @@ NSString *rewriteURL(NSString *urlStr) {
 
 - (BOOL)handleResultServerData:(id)serverData uploadData:(id)uploadData saveData:(id)saveData {
     NSDictionary *photoDict = nil;
-    
+
     if ([saveData isKindOfClass:[NSArray class]] && [(NSArray *)saveData count] > 0) {
         id first = [(NSArray *)saveData objectAtIndex:0];
-        if ([first isKindOfClass:[NSDictionary class]]) {
-            photoDict = first;
-        }
+        if ([first isKindOfClass:[NSDictionary class]]) photoDict = first;
     } else if ([saveData isKindOfClass:[NSDictionary class]]) {
         photoDict = saveData;
     }
-    
+
     if (photoDict && photoDict[@"owner_id"] && (photoDict[@"id"] || photoDict[@"pid"])) {
         g_savedWallPhotoDict = photoDict;
-        NSLog(@"[OpenGate] Saved wall photo dict: owner=%@, id=%@", photoDict[@"owner_id"], photoDict[@"id"] ?: photoDict[@"pid"]);
     }
-    
+
     %orig;
     return YES;
 }
@@ -989,10 +1148,19 @@ NSString *rewriteURL(NSString *urlStr) {
     }
 }
 
+- (void)viewWillAppear:(BOOL)animated {
+    markTitleView(self);
+    %orig;
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    markTitleView(self);
+    %orig;
+}
+
 %new
 - (void)checkFirstLaunch {
     if (![[NSUserDefaults standardUserDefaults] objectForKey:@"mbsoft.opengate.firstLaunchDone"]) {
-        NSLog(@"[OpenGate] Tweak loaded, first launch");
         dispatch_async(dispatch_get_main_queue(), ^{
             [self showInstanceSelection];
         });
@@ -1001,7 +1169,7 @@ NSString *rewriteURL(NSString *urlStr) {
 
 %new
 - (void)showInstanceSelection {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"OpenGate v0.3-alpha"
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"OpenGate v0.4-alpha"
                                                                    message:@"Выберите сервер OpenVK:"
                                                             preferredStyle:UIAlertControllerStyleAlert];
     OpenGateManager *manager = [OpenGateManager sharedManager];
@@ -1017,3 +1185,27 @@ NSString *rewriteURL(NSString *urlStr) {
 }
 
 %end
+
+%group TitleLayout
+
+%hook LayoutAwareView
+
+- (void)layoutSubviews {
+    %orig;
+    if (!g_titleViews) return;
+    if ([g_titleViews containsObject:[NSString stringWithFormat:@"%p", self]]) {
+        centerTitleChildren(self);
+    }
+}
+
+%end
+
+%end
+
+%ctor {
+    g_titleViews = [NSMutableSet set];
+    %init;
+    if (objc_getClass("LayoutAwareView")) {
+        %init(TitleLayout);
+    }
+}

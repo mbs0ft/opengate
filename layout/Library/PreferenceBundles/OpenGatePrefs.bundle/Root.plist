@@ -10,7 +10,7 @@
             <key>label</key>
             <string>Основные настройки OpenGate</string>
             <key>footerText</key>
-            <string>Версия: 0.1 alpha</string>
+            <string>Версия: 0.3.5 alpha</string>
         </dict>
         <dict>
             <key>cell</key>
